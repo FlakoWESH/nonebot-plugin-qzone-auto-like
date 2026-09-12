@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nonebot-plugin-qzone-auto-like"
+version = "0.1.0"
+description = "NoneBot2 QQ空间说说自动点赞插件，后台定时拉取空间说说自动点赞（Alconna优化版）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "your@email.com" },
+]
+keywords = ["nonebot", "nonebot2", "plugin", "qq", "qzone", "auto-like", "space", "alconna"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "nonebot2>=2.0.0",
+    "nonebot-adapter-onebot>=2.0.0",
+    "nonebot-plugin-alconna>=0.50.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-name/nonebot-plugin-qzone-auto-like"
+Repository = "https://github.com/your-name/nonebot-plugin-qzone-auto-like"
+Issues = "https://github.com/your-name/nonebot-plugin-qzone-auto-like/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nonebot_plugin_qzone_auto_like"]
+
+[tool.nonebot]
+plugins = ["nonebot_plugin_qzone_auto_like"]
