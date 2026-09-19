@@ -16,10 +16,12 @@ import asyncio
 from datetime import datetime
 
 from arclet.alconna import Alconna
-from nonebot import get_driver, get_plugin_config
+from nonebot import get_driver, get_plugin_config, require
 from nonebot.adapters.onebot.v11 import Bot
 from nonebot.log import logger
 from nonebot.plugin import PluginMetadata
+
+require("nonebot_plugin_alconna")
 from nonebot_plugin_alconna import UniMessage, on_alconna
 
 from .config import QzoneAutoLikeConfig
