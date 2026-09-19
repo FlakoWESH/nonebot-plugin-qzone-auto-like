@@ -15,14 +15,13 @@
 
 ## 📖 介绍
 
-NoneBot2 QQ 空间说说自动点赞插件，后台定时拉取好友空间说说并自动点赞。支持从 NapCat 自动获取 QQ 空间 Cookie 并推送到 [onebot-qzone](https://github.com/Gu-Heping/onebot-qzone) 桥接服务，无需手动复制粘贴 Cookie。
-
+NoneBot2 QQ 空间说说自动点赞插件，后台定时拉取好友空间说说并自动点赞。支持从 NapCat 自动获取 QQ 空间 Cookie 并推送到 [onebot-qzone](https://github.com/Gu-Heping/onebot-qzone) 桥接服务。
 > 本插件不会保存你的 QQ 密码，QQ 空间 Cookie 由 NapCat 在本地管理，插件仅在本地各服务之间传递。Cookie 不会发送到任何第三方。
 
 ### ✨ 功能特性
 
 - **自动点赞说说**：Bot 启动后后台定时轮询好友空间时间线，对未点赞的说说自动点赞
-- **Cookie 自动刷新**：通过 NapCat 的 `get_cookies` API 自动获取最新 QQ 空间 Cookie，定时推送到 onebot-qzone，再也不用手动粘贴 Cookie
+- **Cookie 自动刷新**：通过 NapCat 的 `get_cookies` API 自动获取最新 QQ 空间 Cookie，定时推送到 onebot-qzone
 - **防重复点赞**：本地记录已点赞的说说 ID，重启不丢失，不会重复点赞同一条
 - **可配置轮询间隔**：自定义轮询频率和每轮最大点赞数
 - **点赞间隔控制**：单条说说之间固定间隔，模拟人工操作，降低风控概率
@@ -236,7 +235,7 @@ QQ空间自动点赞状态
 **排查步骤**：
 1. 确认 NapCat 版本 ≥ v4.18.0
 2. 确认 NapCat 已正确登录 QQ
-3. 在浏览器中用同一 QQ 号访问 https://user.qzone.qq.com，确认能正常打开
+3. 在浏览器中用同一 QQ 号访问[QQ空间](https://user.qzone.qq.com)，确认能正常打开
 4. 如果刚登录 QQ，等待几分钟后再试
 
 ### Q2：Cookie 自动刷新显示"NapCat API 返回错误"
