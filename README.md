@@ -21,7 +21,7 @@ NoneBot2 QQ 空间说说自动点赞插件，后台定时拉取好友空间说�
 ### ✨ 功能特性
 
 - **自动点赞说说**：Bot 启动后后台定时轮询好友空间时间线，对未点赞的说说自动点赞
-- **Cookie 自动刷新**：通过 NapCat 的 `get_cookies` API 自动获取最新 QQ 空间 Cookie，定时推送到 onebot-qzone
+- **Cookie 自动刷新（按需）**：通过 NapCat 的 `get_cookies` API 自动获取最新 QQ 空间 Cookie，先 `check_cookie` 预检再热更新，Cookie 仍有效时自动跳过
 - **防重复点赞**：本地记录已点赞的说说 ID，重启不丢失，不会重复点赞同一条
 - **可配置轮询间隔**：自定义轮询频率和每轮最大点赞数
 - **点赞间隔控制**：单条说说之间固定间隔，模拟人工操作，降低风控概率
@@ -37,9 +37,10 @@ NoneBot2 QQ 空间说说自动点赞插件，后台定时拉取好友空间说�
 │                  │   POST /get_cookies   │ (QQ登录)  │
 │                  │                      └──────────┘
 │  NoneBot2 插件   │
-│ (qzone-auto-like)│   POST /update_cookie ┌──────────────────┐   QQ空间Web API   ┌──────────┐
-│                  │ ◄──────────────────► │  onebot-qzone    │ ◄──────────────► │  QQ空间   │
-│                  │   (动态更新Cookie)    │  (桥接服务)      │   Cookie 认证     │  服务器   │
+│ (qzone-auto-like│   POST /check_cookie  ┌──────────────────┐   QQ空间Web API   ┌──────────┐
+│   按需刷新)      │ ◄───(预检Cookie)─────►│  onebot-qzone    │ ◄──────────────► │  QQ空间   │
+│                  │   POST /update_cookie │  (桥接服务)      │   Cookie 认证     │  服务器   │
+│                  │ ◄───(热更新Cookie)──►│  v2.0.0+         │                  │          │
 └──────────────────┘                      └──────────────────┘                   └──────────┘
 ```
 
@@ -48,8 +49,8 @@ NoneBot2 QQ 空间说说自动点赞插件，后台定时拉取好友空间说�
 | 组件 | 作用 |
 |---|---|
 | **NapCat** | 已登录 QQ 的协议端，提供 `get_cookies` API 获取 QQ 空间 Cookie |
-| **onebot-qzone** | QQ 空间操作桥接服务（Node.js），提供 `update_cookie` API 接收新 Cookie，并暴露点赞/获取说说等 HTTP API |
-| **本插件** | NoneBot2 插件，负责定时从 NapCat 获取 Cookie → 推送到 onebot-qzone，同时定时执行点赞操作 |
+| **onebot-qzone** | QQ 空间操作桥接服务（Node.js v2.0.0+），提供 `check_cookie`（预检）和 `update_cookie`（热更新）API，并暴露点赞/获取说说等 HTTP API |
+| **本插件** | NoneBot2 插件，定时预检 Cookie → 仅在失效时从 NapCat 获取新 Cookie 推送到 onebot-qzone，同时定时执行点赞操作 |
 
 ## 💿 安装
 
@@ -152,24 +153,30 @@ npm start
 | QZONE_BRIDGE_TOKEN | str | `""` | onebot-qzone access token（如设置了鉴权则填） |
 | QZONE_COOKIE_REFRESH_INTERVAL | int | `7200` | Cookie 刷新间隔（秒），默认 2 小时 |
 | QZONE_COOKIE_REQUEST_TIMEOUT | int | `10` | HTTP 请求超时时间（秒） |
+| QZONE_COOKIE_VERIFY_AFTER_UPDATE | bool | `true` | 更新后是否调用 `check_cookie` API 验证新 Cookie 有效 |
 
 ## 🔄 Cookie 自动刷新
 
-启用 `QZONE_ENABLE_AUTO_COOKIE=true` 后，插件会自动完成以下流程，无需手动管理 Cookie：
+启用 `QZONE_ENABLE_AUTO_COOKIE=true` 后，插件会自动管理 Cookie，无需手动复制粘贴。
+
+> **v2.1 按需刷新（防风控）**：每次定时任务先调用 onebot-qzone 的 `check_cookie` API（带网络探针）检测当前 Cookie 是否有效，**只有确认过期/无效时才执行刷新**。Cookie 仍有效时直接跳过，不触发任何变更，大幅降低风控风险。
 
 ```
 每 2 小时自动执行：
-  1. 调用 NapCat: POST /get_cookies  {domain: "user.qzone.qq.com"}
-  2. 验证返回的 Cookie 包含 uin / p_uin / skey / p_skey
-  3. 调用 onebot-qzone: POST /update_cookie  {cookie: "uin=...; p_skey=..."}
-  4. onebot-qzone 自动更新会话并写回 .env
+  1. 预检：调用 onebot-qzone: POST /check_cookie  {probe: true}
+     ├─ Cookie 仍有效 → 跳过，不做任何操作 ✅
+     └─ Cookie 已过期/无效 ↓
+  2. 调用 NapCat: POST /get_cookies  {domain: "user.qzone.qq.com"}
+  3. 验证返回的 Cookie 包含 uin / p_uin / skey / p_skey
+  4. 调用 onebot-qzone: POST /update_cookie  {cookie: "uin=...; p_skey=..."}
+  5. （可选）再次调用 check_cookie 验证新 Cookie 确实生效
 ```
 
 ### 前提条件
 
 1. **NapCat 版本 ≥ v4.18.0** —— 旧版本 `get_cookies` 返回的 `bkn` 计算有 bug，无法正常调用 QQ 空间 API
 2. **NapCat 已开启 HTTP API** —— 在 NapCat 配置中启用 HTTP 服务端口（默认 3000）
-3. **onebot-qzone 桥接服务正在运行** —— 默认监听 5700 端口
+3. **onebot-qzone 桥接服务 v2.0.0+** —— 需要支持 `check_cookie` 和 `update_cookie` API（默认监听 5700 端口）
 4. **NapCat 与本插件网络互通** —— 通常都在同一台机器上，默认地址即可
 
 ### 启用示例
@@ -183,6 +190,16 @@ QZONE_BRIDGE_URL=http://127.0.0.1:5700
 ```
 
 如果 NapCat 或 onebot-qzone 设置了访问令牌，也一并填写。重启 NoneBot2 后，发送"空间点赞状态"即可看到 Cookie 自动刷新状态。
+
+### 工作流程说明
+
+| 步骤 | 说明 |
+|:---:|:---|
+| **预检** | 每次定时任务先调 `check_cookie`，Cookie 还有效就直接跳过，不触发任何变更 |
+| **获取** | 仅当 Cookie 失效时，才从 NapCat `get_cookies` 获取最新 Cookie |
+| **校验** | 检查 Cookie 是否包含 `uin`、`p_uin`、`skey`、`p_skey` 四个必需字段 |
+| **热更新** | 调用 onebot-qzone `update_cookie` API，自动更新内存会话并写回 `.env`，**无需重启服务** |
+| **验证** | 更新后再调一次 `check_cookie`，确认新 Cookie 确实有效（可通过配置关闭） |
 
 ## 🎉 使用
 
@@ -204,14 +221,14 @@ QQ空间自动点赞状态
 
 ─── Cookie 自动刷新 ───
 刷新间隔：7200 秒
-上次刷新：2026-09-18 14:30:00 ✅ 成功
-累计刷新：12 次
+上次检查：2026-09-18 14:30:00 ✅ Cookie 有效（无需刷新）
+累计刷新：3 次
 ```
 
 ### 运行机制
 
 1. Bot 启动后自动注册后台定时任务
-2. **Cookie 刷新任务**：每隔 `QZONE_COOKIE_REFRESH_INTERVAL` 秒，从 NapCat 获取最新 Cookie 并推送到 onebot-qzone
+2. **Cookie 刷新任务**（按需刷新）：每隔 `QZONE_COOKIE_REFRESH_INTERVAL` 秒，先调 `check_cookie` 预检；仅当 Cookie 失效时才从 NapCat 获取最新 Cookie 并推送到 onebot-qzone
 3. **点赞任务**：每隔 `QZONE_LIKE_INTERVAL` 秒拉取好友空间说说，跳过已点赞的，逐条点赞
 4. 已点赞的说说 ID 持久化到 `QZONE_DATA_FILE`，不会重复点赞
 
@@ -223,7 +240,7 @@ QQ空间自动点赞状态
 | **单次上限** | 50 条 | 每次最多点赞 50 条 |
 | **点赞间隔** | 1 秒 | 模拟人工操作节奏 |
 | **已点赞记录** | 永久保留 | 避免重复点赞 |
-| **Cookie 自动刷新** | 7200 秒 | 每 2 小时自动续期 Cookie，避免过期 |
+| **Cookie 自动刷新** | 7200 秒 | 每 2 小时先预检，仅在 Cookie 失效时热更新（防风控） |
 | **异常自动恢复** | 内置 | 出错后自动等待下一轮 |
 
 ## ❓ 常见问题
@@ -250,12 +267,13 @@ QQ空间自动点赞状态
 
 **可能原因**：
 1. Cookie 虽然更新了，但 QQ 空间服务端还未生效（等待 1-2 分钟）
-2. onebot-qzone 桥接服务需要重启才能加载新 Cookie
+2. onebot-qzone 版本过低，不支持热更新（需 v2.0.0+）
 3. 账号被 QQ 空间风控
 
 **解决方法**：
-- 如果使用的是旧版 onebot-qzone（不支持 `update_cookie` API），需要手动重启 onebot-qzone 服务
-- 新版 onebot-qzone 会自动热更新 Cookie，无需重启
+- 确认 onebot-qzone 版本 ≥ v2.0.0，该版本 `update_cookie` API 会自动热更新内存会话并写回 `.env`，无需重启服务
+- 启用 `QZONE_COOKIE_VERIFY_AFTER_UPDATE=true`（默认开启），更新后自动验证新 Cookie 是否真正生效
+- 如果使用的是旧版 onebot-qzone（不支持 `update_cookie` API），需要手动重启服务
 
 ### Q4：不启用 Cookie 自动刷新可以用吗？
 

@@ -60,6 +60,7 @@ if config.qzone_enable_auto_cookie:
         bridge_token=config.qzone_bridge_token,
         refresh_interval=config.qzone_cookie_refresh_interval,
         request_timeout=config.qzone_cookie_request_timeout,
+        verify_after_update=config.qzone_cookie_verify_after_update,
     )
     logger.info("[qzone_auto_like] Cookie 自动刷新已启用")
 else:

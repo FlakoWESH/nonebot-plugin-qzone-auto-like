@@ -49,3 +49,6 @@ class QzoneAutoLikeConfig(BaseModel):
 
     # HTTP 请求超时时间（秒）
     qzone_cookie_request_timeout: int = 10
+
+    # 更新后是否调用 check_cookie API 验证新 Cookie 是否有效
+    qzone_cookie_verify_after_update: bool = True
