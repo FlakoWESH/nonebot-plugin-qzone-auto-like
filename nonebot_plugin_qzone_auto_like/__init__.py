@@ -3,14 +3,17 @@ QQ空间说说自动点赞插件（Alconna优化版）
 功能：
 1. 后台定时拉取QQ空间说说，自动点赞未点赞的说说
 2. 命令查询自动点赞状态
+3. 自动从 NapCat 获取 QQ 空间 Cookie 并推送到 onebot-qzone 桥接服务
 优化点：
 - 使用 Alconna 命令解析器替代 on_command
 - 使用 UniMessage 统一消息发送，支持多行文本拼接
 依赖：
-- 运行时需安装 onebot-qzone 库（pip install onebot-qzone）
-- 未安装时插件仍可加载，仅自动点赞功能不生效
+- 自动点赞依赖 onebot-qzone 桥接服务（Node.js HTTP API）
+- Cookie 自动刷新需 NapCat HTTP API
+- 未安装/未配置时插件仍可正常加载，仅对应功能不生效
 """
 import asyncio
+from datetime import datetime
 
 from arclet.alconna import Alconna
 from nonebot import get_driver, get_plugin_config
@@ -20,18 +23,20 @@ from nonebot.plugin import PluginMetadata
 from nonebot_plugin_alconna import UniMessage, on_alconna
 
 from .config import QzoneAutoLikeConfig
+from .cookie_refresher import CookieRefresher
 from .storage import QzoneLikeStore
 
 # ========== 插件元数据 ==========
 __plugin_meta__ = PluginMetadata(
     name="QQ空间说说自动点赞",
-    description="自动点赞QQ空间好友说说（Alconna优化版）",
+    description="自动点赞QQ空间好友说说，支持Cookie自动刷新",
     usage=(
         "空间点赞状态 - 查询自动点赞功能状态\n"
-        "后台自动轮询QQ空间说说并点赞"
+        "后台自动轮询QQ空间说说并点赞\n"
+        "可选：自动从 NapCat 获取 Cookie 并推送到桥接服务"
     ),
     type="application",
-    homepage="https://github.com/nonebot/plugin-alconna",
+    homepage="https://github.com/FlakoWESH/nonebot-plugin-qzone-auto-like",
     supported_adapters={"~onebot.v11"},
 )
 
@@ -42,6 +47,21 @@ store = QzoneLikeStore(config.qzone_data_file)
 # 后台任务状态标记
 _task_started = False
 _task_running = False
+
+# Cookie 自动刷新器（仅在启用时创建）
+_cookie_refresher: CookieRefresher | None = None
+if config.qzone_enable_auto_cookie:
+    _cookie_refresher = CookieRefresher(
+        napcat_url=config.qzone_napcat_url,
+        napcat_token=config.qzone_napcat_token,
+        bridge_url=config.qzone_bridge_url,
+        bridge_token=config.qzone_bridge_token,
+        refresh_interval=config.qzone_cookie_refresh_interval,
+        request_timeout=config.qzone_cookie_request_timeout,
+    )
+    logger.info("[qzone_auto_like] Cookie 自动刷新已启用")
+else:
+    logger.info("[qzone_auto_like] Cookie 自动刷新未启用（设置 QZONE_ENABLE_AUTO_COOKIE=true 开启）")
 
 
 # ========== 核心：自动点赞循环 ==========
@@ -137,9 +157,6 @@ async def _auto_like_loop():
 
 
 # ========== 命令：查询自动点赞状态 ==========
-# Alconna优化点：
-# - on_alconna(Alconna("空间点赞状态")) 替代 on_command("空间点赞状态")
-# - 无需定义参数，Alconna自动匹配命令
 status_cmd = on_alconna(
     Alconna("空间点赞状态"),
     priority=5,
@@ -149,13 +166,7 @@ status_cmd = on_alconna(
 
 @status_cmd.handle()
 async def query_status():
-    """查询自动点赞功能状态
-
-    Alconna优化点：
-    - 使用 UniMessage.text() 拼接多行文本
-    - 使用 .finish() 发送并结束事件
-    - 替代原生的 matcher.finish("多行\n文本") 字符串拼接
-    """
+    """查询自动点赞功能状态"""
     enabled = config.qzone_enable_auto_like
     status_text = "已启用" if enabled else "已禁用"
     running_text = "运行中" if _task_running else "空闲中"
@@ -170,6 +181,28 @@ async def query_status():
         + UniMessage.text(f"每轮上限：{config.qzone_max_like_count} 条\n")
         + UniMessage.text(f"累计已点赞：{liked_count} 条说说")
     )
+
+    # Cookie 自动刷新状态
+    if _cookie_refresher is not None:
+        cookie_status = _cookie_refresher.get_status()
+        result += UniMessage.text("\n\n─── Cookie 自动刷新 ───\n")
+        result += UniMessage.text(f"刷新间隔：{cookie_status['refresh_interval']} 秒\n")
+
+        if cookie_status["last_refresh_time"]:
+            last_time = datetime.fromtimestamp(cookie_status["last_refresh_time"]).strftime("%Y-%m-%d %H:%M:%S")
+            if cookie_status["last_refresh_success"]:
+                result += UniMessage.text(f"上次刷新：{last_time} ✅ 成功\n")
+            else:
+                result += UniMessage.text(
+                    f"上次刷新：{last_time} ❌ 失败\n"
+                    f"错误：{cookie_status['last_error'] or '未知'}\n"
+                )
+        else:
+            result += UniMessage.text("上次刷新：尚未执行\n")
+
+        result += UniMessage.text(f"累计刷新：{cookie_status['refresh_count']} 次")
+    else:
+        result += UniMessage.text("\n\nCookie 自动刷新：未启用")
 
     # 检查onebot-qzone是否安装
     try:
@@ -186,9 +219,14 @@ async def query_status():
 # ========== 启动钩子：启动后台任务 ==========
 @get_driver().on_startup
 async def _startup():
-    """Bot启动时启动自动点赞后台任务"""
+    """Bot启动时启动自动点赞后台任务和Cookie刷新任务"""
     global _task_started
     if not _task_started:
         _task_started = True
         asyncio.create_task(_auto_like_loop())
-        logger.info("[qzone_auto_like] 后台任务已注册启动")
+        logger.info("[qzone_auto_like] 自动点赞后台任务已注册启动")
+
+        # 启动 Cookie 自动刷新任务
+        if _cookie_refresher is not None:
+            asyncio.create_task(_cookie_refresher.refresh_loop())
+            logger.info("[qzone_auto_like] Cookie 自动刷新后台任务已注册启动")
