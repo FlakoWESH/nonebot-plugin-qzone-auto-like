@@ -96,3 +96,21 @@ class QzoneLikeStore:
         async with self._lock:
             self._load()
             return len(self._liked_posts)
+
+    async def get_today_liked_count(self, qq_number: str) -> int:
+        """获取指定 QQ 号今日已点赞的说说数量"""
+        async with self._lock:
+            self._load()
+            today = datetime.now().date().isoformat()
+            return sum(
+                1
+                for h in self._like_history
+                if h.get("qq_number") == str(qq_number)
+                and h.get("like_time", "").startswith(today)
+            )
+
+    async def filter_unliked(self, post_ids: list[str]) -> list[str]:
+        """批量过滤，返回尚未点赞的 post_id 列表（保持原顺序）"""
+        async with self._lock:
+            self._load()
+            return [pid for pid in post_ids if pid and pid not in self._liked_posts]
