@@ -27,6 +27,26 @@ class QzoneAutoLikeConfig(BaseModel):
     # 每日最多点赞条数（0 表示不限制），防风控
     qzone_daily_like_limit: int = 200
 
+    # ===== 自动秒评配置（需 onebot-qzone 桥接服务支持 send_comment） =====
+
+    # 是否启用自动秒评（默认关闭，评论比点赞更易触发风控）
+    qzone_enable_auto_comment: bool = False
+
+    # 每轮最多评论条数
+    qzone_comment_max_per_round: int = 5
+
+    # 每日最多评论条数（0 表示不限制）
+    qzone_comment_daily_limit: int = 50
+
+    # 单条评论之间的最小随机延迟（秒），评论延迟建议比点赞更大
+    qzone_comment_delay_min: float = 5.0
+
+    # 单条评论之间的最大随机延迟（秒）
+    qzone_comment_delay_max: float = 15.0
+
+    # 全局秒评内容（支持 {nickname} 变量）
+    qzone_comment_template: str = "QεQ"
+
     # 点赞记录数据文件路径
     qzone_data_file: str = "data/qzone_like_records.json"
 

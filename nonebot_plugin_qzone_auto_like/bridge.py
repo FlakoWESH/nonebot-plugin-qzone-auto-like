@@ -1,8 +1,7 @@
 """onebot-qzone 桥接服务 HTTP 客户端（NoneBot 版）。
 
-封装桥接服务的 Cookie 相关 action，统一 session 复用、鉴权和错误处理。
-NoneBot 版点赞链路走 QzoneSession（进程内直接操作），因此本客户端只封装
-Cookie 预检与热更新两个 action。
+封装桥接服务的 action，统一 session 复用、鉴权和错误处理。
+包含 Cookie 预检/热更新，以及时间线拉取和评论能力（秒评功能使用）。
 """
 from __future__ import annotations
 
@@ -69,4 +68,22 @@ class QzoneBridgeClient:
     async def update_cookie(self, cookie: str) -> dict[str, Any]:
         """热更新 Cookie，返回 user_id/nickname/message。"""
         data = await self.call_data("update_cookie", {"cookie": cookie})
+        return data or {}
+
+    async def get_friend_feeds(self, num: int = 50, cursor: str = "") -> dict[str, Any]:
+        """拉取好友空间时间线。"""
+        params: dict[str, Any] = {"num": max(1, num)}
+        if cursor:
+            params["cursor"] = cursor
+        data = await self.call_data("get_friend_feeds", params)
+        return data or {}
+
+    async def send_comment(
+        self, tid: str, content: str, user_id: str = ""
+    ) -> dict[str, Any]:
+        """给指定说说发表评论，返回 comment_id 等。"""
+        params: dict[str, Any] = {"tid": str(tid), "content": content}
+        if user_id:
+            params["user_id"] = str(user_id)
+        data = await self.call_data("send_comment", params)
         return data or {}
