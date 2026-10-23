@@ -1,12 +1,14 @@
 """
-QQ空间点赞/评论记录存储模块（JSON文件实现）
-用于记录已点赞/已评论的说说ID，避免重复操作
+QQ空间点赞/评论记录与名单存储模块（JSON文件实现）
+用于记录已点赞/已评论的说说ID，避免重复操作；同时持久化评论名单与点赞勿扰名单。
 数据结构：
 {
     "liked_posts": ["post_id_1", ...],
     "like_history": [{"qq_number": "...", "post_id": "...", "like_time": "..."}],
     "commented_posts": ["post_id_1", ...],
-    "comment_history": [{"qq_number": "...", "post_id": "...", "content": "...", "comment_time": "..."}]
+    "comment_history": [{"qq_number": "...", "post_id": "...", "content": "...", "comment_time": "..."}],
+    "comment_allowed": ["qq_1", ...],
+    "like_denied": ["qq_2", ...]
 }
 """
 import asyncio
@@ -20,7 +22,7 @@ from nonebot.log import logger
 
 
 class QzoneLikeStore:
-    """QQ空间点赞/评论记录存储器"""
+    """QQ空间点赞/评论记录与名单存储器"""
 
     def __init__(self, file_path: str):
         self.file_path = Path(file_path)
@@ -29,6 +31,8 @@ class QzoneLikeStore:
         self._like_history: List[dict] = []
         self._commented_posts: Set[str] = set()
         self._comment_history: List[dict] = []
+        self._comment_allowed: Set[str] = set()
+        self._like_denied: Set[str] = set()
         self._loaded = False
 
     def _ensure_dir(self):
@@ -46,22 +50,28 @@ class QzoneLikeStore:
                 self._like_history = data.get("like_history", [])
                 self._commented_posts = set(data.get("commented_posts", []))
                 self._comment_history = data.get("comment_history", [])
+                self._comment_allowed = set(data.get("comment_allowed", []))
+                self._like_denied = set(data.get("like_denied", []))
                 logger.info(
                     f"QQ空间记录加载成功，已点赞 {len(self._liked_posts)} 条，"
-                    f"已评论 {len(self._commented_posts)} 条"
+                    f"已评论 {len(self._commented_posts)} 条，"
+                    f"评论名单 {len(self._comment_allowed)} 人，"
+                    f"勿扰名单 {len(self._like_denied)} 人"
                 )
             except (json.JSONDecodeError, IOError) as e:
                 logger.warning(f"QQ空间记录文件损坏，将重新创建: {e}")
-                self._liked_posts = set()
-                self._like_history = []
-                self._commented_posts = set()
-                self._comment_history = []
+                self._reset_all()
         else:
-            self._liked_posts = set()
-            self._like_history = []
-            self._commented_posts = set()
-            self._comment_history = []
+            self._reset_all()
         self._loaded = True
+
+    def _reset_all(self):
+        self._liked_posts = set()
+        self._like_history = []
+        self._commented_posts = set()
+        self._comment_history = []
+        self._comment_allowed = set()
+        self._like_denied = set()
 
     def _save(self):
         """保存数据到文件"""
@@ -71,6 +81,8 @@ class QzoneLikeStore:
             "like_history": self._like_history[-1000:],
             "commented_posts": list(self._commented_posts),
             "comment_history": self._comment_history[-1000:],
+            "comment_allowed": sorted(self._comment_allowed),
+            "like_denied": sorted(self._like_denied),
         }
         tmp_path = self.file_path.with_suffix(".tmp")
         try:
@@ -174,3 +186,105 @@ class QzoneLikeStore:
         async with self._lock:
             self._load()
             return [pid for pid in post_ids if pid and pid not in self._commented_posts]
+
+    # ========== 评论名单（默认空，为空时不评论任何人） ==========
+
+    async def add_comment_allowed(self, qq: str) -> bool:
+        """加入评论名单，返回是否为新增。"""
+        value = str(qq).strip()
+        async with self._lock:
+            self._load()
+            if value in self._comment_allowed:
+                return False
+            self._comment_allowed.add(value)
+            self._save()
+            return True
+
+    async def remove_comment_allowed(self, qq: str) -> bool:
+        """移出评论名单，返回是否存在过。"""
+        value = str(qq).strip()
+        async with self._lock:
+            self._load()
+            if value not in self._comment_allowed:
+                return False
+            self._comment_allowed.discard(value)
+            self._save()
+            return True
+
+    async def get_comment_allowed(self) -> set[str]:
+        """获取评论名单集合。"""
+        async with self._lock:
+            self._load()
+            return set(self._comment_allowed)
+
+    async def list_comment_allowed(self) -> list[str]:
+        """获取排序后的评论名单。"""
+        async with self._lock:
+            self._load()
+            return sorted(self._comment_allowed)
+
+    async def count_comment_allowed(self) -> int:
+        """获取评论名单人数。"""
+        async with self._lock:
+            self._load()
+            return len(self._comment_allowed)
+
+    async def clear_comment_allowed(self) -> int:
+        """清空评论名单，返回清空人数。"""
+        async with self._lock:
+            self._load()
+            removed = len(self._comment_allowed)
+            self._comment_allowed.clear()
+            self._save()
+            return removed
+
+    # ========== 点赞勿扰名单 ==========
+
+    async def add_like_denied(self, qq: str) -> bool:
+        """加入点赞勿扰名单，返回是否为新增。"""
+        value = str(qq).strip()
+        async with self._lock:
+            self._load()
+            if value in self._like_denied:
+                return False
+            self._like_denied.add(value)
+            self._save()
+            return True
+
+    async def remove_like_denied(self, qq: str) -> bool:
+        """移出点赞勿扰名单，返回是否存在过。"""
+        value = str(qq).strip()
+        async with self._lock:
+            self._load()
+            if value not in self._like_denied:
+                return False
+            self._like_denied.discard(value)
+            self._save()
+            return True
+
+    async def get_like_denied(self) -> set[str]:
+        """获取点赞勿扰名单集合。"""
+        async with self._lock:
+            self._load()
+            return set(self._like_denied)
+
+    async def list_like_denied(self) -> list[str]:
+        """获取排序后的点赞勿扰名单。"""
+        async with self._lock:
+            self._load()
+            return sorted(self._like_denied)
+
+    async def count_like_denied(self) -> int:
+        """获取点赞勿扰名单人数。"""
+        async with self._lock:
+            self._load()
+            return len(self._like_denied)
+
+    async def clear_like_denied(self) -> int:
+        """清空点赞勿扰名单，返回清空人数。"""
+        async with self._lock:
+            self._load()
+            removed = len(self._like_denied)
+            self._like_denied.clear()
+            self._save()
+            return removed

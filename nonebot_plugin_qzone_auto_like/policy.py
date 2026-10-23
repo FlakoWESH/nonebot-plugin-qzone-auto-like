@@ -40,6 +40,37 @@ def parse_interval(text: str) -> int | None:
     return None
 
 
+def parse_target_qq(
+    text: str,
+    at_targets: list[str] | tuple[str, ...] = (),
+    self_qq: str = "",
+) -> str | None:
+    """解析目标 QQ：优先 @，其次文本中的 5-12 位数字。"""
+    for target in at_targets:
+        value = str(target).strip()
+        if value.isdigit() and value != self_qq:
+            return value
+    match = _QQ_RE.search(text or "")
+    if not match:
+        return None
+    value = match.group(1)
+    if value == self_qq:
+        return None
+    return value
+
+
+def should_like(global_enabled: bool, accept_like: bool | None) -> bool:
+    """点赞默认接收；accept_like=False 表示勿扰。"""
+    if not global_enabled:
+        return False
+    return accept_like is not False
+
+
+def should_comment(global_enabled: bool, accept_comment: bool | None) -> bool:
+    """评论默认不接收；只有 accept_comment=True 才执行。"""
+    return bool(global_enabled and accept_comment is True)
+
+
 def choose_template(personal: str | None, global_template: str | None) -> str:
     """个人模板优先，其次全局模板，最后内置默认值。"""
     for value in (personal, global_template):

@@ -33,7 +33,9 @@ from nonebot_plugin_alconna import UniMessage, on_alconna
 from .bridge import QzoneBridgeClient
 from .config import QzoneAutoLikeConfig
 from .cookie_refresher import CookieRefresher
+from .feed import FeedScanner, normalize_posts
 from .policy import choose_template, render_template
+from .selection import select_comment_candidates
 from .storage import QzoneLikeStore
 
 # ========== 插件元数据 ==========
@@ -95,78 +97,67 @@ else:
 # ========== 秒评子任务 ==========
 
 async def _run_comment_pass(qq_number: str) -> None:
-    """执行一轮秒评：通过桥接服务拉取时间线并评论未评论的说说。"""
+    """执行一轮秒评。
+
+    核心安全设计（与真寻版一致）：
+    - 只评论「评论名单」内的好友，名单默认空，为空时不评论任何人；
+    - 已评论过的说说、自己的说说均跳过；
+    - 每日限额 + 每轮上限 + 随机延迟，防风控。
+    """
     if _bridge is None:
         return
 
+    # 评论名单：为空则不评论（核心，避免对所有好友刷屏）
+    allowed = await store.get_comment_allowed()
+    if not allowed:
+        logger.info(
+            "[qzone_auto_like] 评论名单为空，本轮不评论任何人"
+            "（可用 add_comment_allowed 或后续指令加入）"
+        )
+        return
+
+    # 每日限额检查
     daily_limit = config.qzone_comment_daily_limit
-    if daily_limit > 0:
-        today_commented = await store.get_today_commented_count(qq_number)
-        if today_commented >= daily_limit:
-            logger.info(
-                f"[qzone_auto_like] 已达每日评论上限({daily_limit})，本轮跳过"
-            )
-            return
-
-    # 通过桥接服务拉取时间线
-    try:
-        data = await _bridge.get_friend_feeds(num=config.qzone_max_like_count)
-    except Exception as e:
-        logger.warning(f"[qzone_auto_like] 秒评拉取时间线失败: {e}")
+    today_commented = await store.get_today_commented_count(qq_number)
+    if daily_limit > 0 and today_commented >= daily_limit:
+        logger.info(
+            f"[qzone_auto_like] 已达每日评论上限({daily_limit})，本轮跳过"
+        )
         return
 
-    msglist = data.get("msglist") if isinstance(data, dict) else None
-    if not isinstance(msglist, list):
-        logger.info("[qzone_auto_like] 秒评：时间线为空或结构异常")
+    # 通过桥接服务一次拉取时间线并规范化
+    scanner = FeedScanner(_bridge)
+    posts = await scanner.scan(config.qzone_max_like_count)
+    if not posts:
         return
 
-    # 提取 post_id 和作者信息
-    candidates: list[tuple[str, str, str]] = []  # (tid, uin, nickname)
-    seen: set[str] = set()
-    for post in msglist:
-        if not isinstance(post, dict):
-            continue
-        tid = str(post.get("tid") or post.get("cellid") or "").strip()
-        if not tid or tid in seen:
-            continue
-        seen.add(tid)
-        uin = ""
-        for key in ("user_id", "uin", "hostuin", "host_uin"):
-            v = post.get(key)
-            if v not in (None, ""):
-                uin = str(v).strip()
-                break
-        nickname = ""
-        for key in ("nickname", "name", "remark"):
-            v = post.get(key)
-            if v not in (None, ""):
-                nickname = str(v).strip()
-                break
-        candidates.append((tid, uin, nickname))
+    # 计算已评论集合（用 filter_uncommented 的差集得到）
+    all_tids = [post.tid for post in posts]
+    uncommented = set(await store.filter_uncommented(all_tids))
+    existing = set(all_tids) - uncommented
 
-    if not candidates:
-        return
-
-    # 批量过滤已评论
-    all_tids = [c[0] for c in candidates]
-    pending_tids = set(await store.filter_uncommented(all_tids))
-    pending = [c for c in candidates if c[0] in pending_tids]
+    # 纯函数筛选：名单内 + 未评论 + 非自己
+    pending = select_comment_candidates(
+        posts,
+        allowed=allowed,
+        existing=existing,
+        self_qq=qq_number,
+        limit=config.qzone_comment_max_per_round
+        if config.qzone_comment_max_per_round > 0
+        else None,
+    )
 
     if not pending:
-        logger.info("[qzone_auto_like] 秒评：没有新的说说需要评论")
+        logger.info("[qzone_auto_like] 秒评：没有符合条件的说说需要评论")
         return
 
     # 每日限额截断
     if daily_limit > 0:
         remaining = daily_limit - today_commented
-        pending = pending[:remaining]
+        if remaining < len(pending):
+            pending = pending[:remaining]
 
-    # 每轮上限
-    max_per_round = config.qzone_comment_max_per_round
-    if max_per_round > 0:
-        pending = pending[:max_per_round]
-
-    # 随机延迟区间
+    # 随机延迟区间（评论比点赞更保守）
     delay_low, delay_high = sorted(
         (max(0.0, config.qzone_comment_delay_min),
          max(0.0, config.qzone_comment_delay_max))
@@ -175,21 +166,24 @@ async def _run_comment_pass(qq_number: str) -> None:
     global_template = config.qzone_comment_template
     commented = 0
     failed = 0
-    for tid, uin, nickname in pending:
+    last_tid = pending[-1].tid
+    for post in pending:
+        # NoneBot 版暂不支持个人模板，统一使用全局模板
         content = render_template(
-            choose_template(None, global_template), nickname
+            choose_template(None, global_template), post.nickname
         )[:100]
         try:
-            await _bridge.send_comment(tid, content, uin)
-            await store.mark_commented(qq_number, tid, content)
+            await _bridge.send_comment(post.tid, content, post.uin)
+            await store.mark_commented(qq_number, post.tid, content)
             commented += 1
-            logger.debug(f"[qzone_auto_like] 已评论说说 tid={tid}: {content}")
+            logger.debug(f"[qzone_auto_like] 已评论说说 tid={post.tid}: {content}")
         except Exception as e:
             failed += 1
-            logger.warning(f"[qzone_auto_like] 评论失败 tid={tid}: {e}")
+            logger.warning(f"[qzone_auto_like] 评论失败 tid={post.tid}: {e}")
             continue
 
-        if delay_high > 0 and tid != pending[-1][0]:
+        # 最后一条不等待
+        if delay_high > 0 and post.tid != last_tid:
             await asyncio.sleep(random.uniform(delay_low, delay_high))
 
     if commented or failed:
@@ -351,11 +345,15 @@ async def query_status():
     running_text = "运行中" if _task_running else "空闲中"
     liked_count = await store.get_liked_count()
     commented_count = await store.get_commented_count()
+    comment_allowed_count = await store.count_comment_allowed()
+    like_denied_count = await store.count_like_denied()
 
     result = (
         UniMessage.text("QQ空间自动互动状态\n")
-        + UniMessage.text(f"秒赞：{'已启用' if like_enabled else '已禁用'}\n")
-        + UniMessage.text(f"秒评：{'已启用' if comment_enabled else '已禁用'}\n")
+        + UniMessage.text(f"秒赞：{'已启用' if like_enabled else '已禁用'}"
+                          f"（勿扰 {like_denied_count} 人）\n")
+        + UniMessage.text(f"秒评：{'已启用' if comment_enabled else '已禁用'}"
+                          f"（评论名单 {comment_allowed_count} 人）\n")
         + UniMessage.text(f"任务状态：{running_text}\n")
         + UniMessage.text(f"轮询间隔：{config.qzone_like_interval} 秒\n")
         + UniMessage.text(f"点赞每日上限：{config.qzone_daily_like_limit or '不限'} 条\n")

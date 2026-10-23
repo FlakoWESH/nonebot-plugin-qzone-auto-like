@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nonebot-plugin-qzone-auto-like"
-version = "0.2.0"
+version = "0.2.1"
 description = "NoneBot2 QQ空间说说自动点赞与秒评插件，后台定时拉取空间说说自动点赞/评论（Alconna优化版）"
 readme = "README.md"
 requires-python = ">=3.10"
