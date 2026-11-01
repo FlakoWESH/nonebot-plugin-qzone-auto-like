@@ -4,17 +4,18 @@ QQ空间说说自动点赞与秒评插件（Alconna优化版）
 1. 后台定时拉取QQ空间说说，自动点赞未点赞的说说
 2. 可选自动秒评（通过 onebot-qzone 桥接服务 send_comment）
 3. 命令查询自动点赞/秒评状态（限超级用户）
-4. 自动从 NapCat 获取 QQ 空间 Cookie 并推送到桥接服务
-优化点：
-- 使用 Alconna 命令解析器替代 on_command
-- Cookie 获取优先复用 OneBot 连接（bot.call_api），无需额外 NapCat HTTP API
-- 点赞/评论批量去重、每日限额、随机延迟，防风控
-- 点赞/评论成功后才落库，避免失败被永久跳过
+4. 自动从协议端（NapCat/SnowLuma）获取 QQ 空间 Cookie 并推送到桥接服务
+架构与风控：
+- 点赞/评论全部走 onebot-qzone 桥接服务（HTTP action），不依赖裸 Python 库
+- 桥接服务统一管理请求指纹：User-Agent/Accept-Language 随机化、三级点赞 fallback、
+  反爬检测、限流码识别，比进程内裸 HTTP 更不易被风控
+- 点赞/秒评共享一次 FeedScanner 时间线扫描，减少请求次数
+- 点赞勿扰名单 / 评论名单：评论默认只对名单内好友生效
+- 批量去重、每日限额、随机延迟；成功后才落库，避免失败被永久跳过
 - 秒评内容支持 {nickname} 模板变量
 依赖：
-- 自动点赞依赖 onebot-qzone Python 库（进程内直接操作 QQ 空间 API）
-- 秒评/Cookie 刷新需 onebot-qzone 桥接服务（v2.0.0+）
-- 未安装/未配置时插件仍可正常加载，仅对应功能不生效
+- 点赞/秒评/Cookie 刷新均依赖 onebot-qzone 桥接服务（v2.0.0+，提供 send_like/send_comment/get_friend_feeds/check_cookie/update_cookie）
+- 未启动桥接服务时插件仍可加载，仅互动功能不生效
 """
 import asyncio
 import random
@@ -33,9 +34,9 @@ from nonebot_plugin_alconna import UniMessage, on_alconna
 from .bridge import QzoneBridgeClient
 from .config import QzoneAutoLikeConfig
 from .cookie_refresher import CookieRefresher
-from .feed import FeedScanner, normalize_posts
+from .feed import FeedScanner, QzonePost
 from .policy import choose_template, render_template
-from .selection import select_comment_candidates
+from .selection import select_comment_candidates, select_like_candidates
 from .storage import QzoneLikeStore
 
 # ========== 插件元数据 ==========
@@ -44,8 +45,8 @@ __plugin_meta__ = PluginMetadata(
     description="自动点赞QQ空间好友说说，可选秒评，支持Cookie自动刷新",
     usage=(
         "空间点赞状态 - 查询自动点赞/秒评状态（限超级用户）\n"
-        "后台自动轮询QQ空间说说并点赞\n"
-        "可选：自动秒评、自动从 NapCat 获取 Cookie"
+        "后台自动轮询QQ空间说说并点赞/评论（走桥接服务统一指纹）\n"
+        "可选：自动从协议端获取 Cookie 推送到桥接服务"
     ),
     type="application",
     homepage="https://github.com/FlakoWESH/nonebot-plugin-qzone-auto-like",
@@ -60,9 +61,13 @@ store = QzoneLikeStore(config.qzone_data_file)
 _task_started = False
 _task_running = False
 
-# 桥接客户端（Cookie 刷新或秒评启用时创建）
+# 桥接客户端：点赞/秒评/Cookie 任一功能启用时都需要
 _bridge: QzoneBridgeClient | None = None
-if config.qzone_enable_auto_cookie or config.qzone_enable_auto_comment:
+if (
+    config.qzone_enable_auto_like
+    or config.qzone_enable_auto_comment
+    or config.qzone_enable_auto_cookie
+):
     _bridge = QzoneBridgeClient(
         base_url=config.qzone_bridge_url,
         token=config.qzone_bridge_token,
@@ -94,10 +99,83 @@ else:
     logger.info("[qzone_auto_like] Cookie 自动刷新未启用")
 
 
-# ========== 秒评子任务 ==========
+# ========== 点赞子任务（走桥接 send_like） ==========
 
-async def _run_comment_pass(qq_number: str) -> None:
-    """执行一轮秒评。
+async def _run_like_pass(qq_number: str, posts: list[QzonePost]) -> None:
+    """对已拉取的时间线执行一轮点赞。
+
+    点赞走桥接服务 send_like，由桥接层统一管理 UA 指纹与反爬。
+    跳过已点赞、勿扰名单内作者的说说。
+    """
+    if _bridge is None:
+        return
+
+    # 每日限额检查
+    daily_limit = config.qzone_daily_like_limit
+    today_count = await store.get_today_liked_count(qq_number)
+    if daily_limit > 0 and today_count >= daily_limit:
+        logger.info(
+            f"[qzone_auto_like] 已达每日点赞上限({daily_limit})，本轮跳过"
+        )
+        return
+
+    # 计算已点赞集合（用差集得到）
+    all_tids = [post.tid for post in posts]
+    unliked = set(await store.filter_unliked(all_tids))
+    existing = set(all_tids) - unliked
+
+    denied = await store.get_like_denied()
+    pending = select_like_candidates(
+        posts,
+        denied=denied,
+        existing=existing,
+        limit=config.qzone_max_like_count
+        if config.qzone_max_like_count > 0
+        else None,
+    )
+
+    if not pending:
+        logger.info("[qzone_auto_like] 点赞：没有需要点赞的新说说")
+        return
+
+    # 每日限额截断
+    if daily_limit > 0:
+        remaining = daily_limit - today_count
+        if remaining < len(pending):
+            pending = pending[:remaining]
+
+    delay_low, delay_high = sorted(
+        (max(0.0, config.qzone_like_random_delay_min),
+         max(0.0, config.qzone_like_random_delay_max))
+    )
+
+    liked = 0
+    failed = 0
+    last_tid = pending[-1].tid
+    for post in pending:
+        try:
+            await _bridge.send_like(post.tid, post.uin)
+            await store.mark_liked(qq_number, post.tid)
+            liked += 1
+            logger.debug(f"[qzone_auto_like] 已点赞说说 tid={post.tid}")
+        except Exception as e:
+            failed += 1
+            logger.warning(f"[qzone_auto_like] 点赞失败 tid={post.tid}: {e}")
+            continue
+
+        if delay_high > 0 and post.tid != last_tid:
+            await asyncio.sleep(random.uniform(delay_low, delay_high))
+
+    if liked or failed:
+        logger.info(
+            f"[qzone_auto_like] 本轮点赞完成 点赞={liked} 失败={failed}"
+        )
+
+
+# ========== 秒评子任务（走桥接 send_comment） ==========
+
+async def _run_comment_pass(qq_number: str, posts: list[QzonePost]) -> None:
+    """对已拉取的时间线执行一轮秒评。
 
     核心安全设计（与真寻版一致）：
     - 只评论「评论名单」内的好友，名单默认空，为空时不评论任何人；
@@ -112,7 +190,6 @@ async def _run_comment_pass(qq_number: str) -> None:
     if not allowed:
         logger.info(
             "[qzone_auto_like] 评论名单为空，本轮不评论任何人"
-            "（可用 add_comment_allowed 或后续指令加入）"
         )
         return
 
@@ -125,13 +202,7 @@ async def _run_comment_pass(qq_number: str) -> None:
         )
         return
 
-    # 通过桥接服务一次拉取时间线并规范化
-    scanner = FeedScanner(_bridge)
-    posts = await scanner.scan(config.qzone_max_like_count)
-    if not posts:
-        return
-
-    # 计算已评论集合（用 filter_uncommented 的差集得到）
+    # 计算已评论集合
     all_tids = [post.tid for post in posts]
     uncommented = set(await store.filter_uncommented(all_tids))
     existing = set(all_tids) - uncommented
@@ -168,7 +239,6 @@ async def _run_comment_pass(qq_number: str) -> None:
     failed = 0
     last_tid = pending[-1].tid
     for post in pending:
-        # NoneBot 版暂不支持个人模板，统一使用全局模板
         content = render_template(
             choose_template(None, global_template), post.nickname
         )[:100]
@@ -182,7 +252,6 @@ async def _run_comment_pass(qq_number: str) -> None:
             logger.warning(f"[qzone_auto_like] 评论失败 tid={post.tid}: {e}")
             continue
 
-        # 最后一条不等待
         if delay_high > 0 and post.tid != last_tid:
             await asyncio.sleep(random.uniform(delay_low, delay_high))
 
@@ -192,9 +261,9 @@ async def _run_comment_pass(qq_number: str) -> None:
         )
 
 
-# ========== 核心：自动互动循环 ==========
+# ========== 核心：自动互动循环（点赞/秒评共享一次扫描） ==========
 async def _auto_like_loop():
-    """自动点赞+秒评后台循环任务"""
+    """自动点赞+秒评后台循环任务。"""
     global _task_running
     logger.info("[qzone_auto_like] 自动互动后台任务已启动")
 
@@ -205,12 +274,16 @@ async def _auto_like_loop():
                 await asyncio.sleep(60)
                 continue
 
+            if _bridge is None:
+                logger.warning("[qzone_auto_like] 桥接客户端未初始化，本轮跳过")
+                await asyncio.sleep(config.qzone_like_interval)
+                continue
+
             _task_running = True
 
             # 获取当前Bot实例
             try:
                 from nonebot import get_bot
-
                 bot = get_bot()
             except Exception:
                 logger.warning("[qzone_auto_like] 未找到可用的Bot实例，等待重连...")
@@ -220,112 +293,35 @@ async def _auto_like_loop():
 
             qq_number = config.qzone_qq_number or str(bot.self_id)
 
-            # ===== 点赞子任务 =====
-            if config.qzone_enable_auto_like:
-                await _run_like_pass(qq_number)
-
-            # ===== 秒评子任务 =====
+            # 一次拉取时间线，点赞和秒评共用（减少对桥接服务的请求次数）
+            scan_num = config.qzone_max_like_count
             if config.qzone_enable_auto_comment:
-                try:
-                    await _run_comment_pass(qq_number)
-                except Exception as e:
-                    logger.error(f"[qzone_auto_like] 秒评过程出现错误: {e}")
+                comment_scan = config.qzone_comment_max_per_round * 3
+                scan_num = max(scan_num, comment_scan, 50)
+            posts = await FeedScanner(_bridge).scan(scan_num)
+
+            if posts:
+                # ===== 点赞子任务 =====
+                if config.qzone_enable_auto_like:
+                    try:
+                        await _run_like_pass(qq_number, posts)
+                    except Exception as e:
+                        logger.error(f"[qzone_auto_like] 点赞过程出错: {e}")
+
+                # ===== 秒评子任务 =====
+                if config.qzone_enable_auto_comment:
+                    try:
+                        await _run_comment_pass(qq_number, posts)
+                    except Exception as e:
+                        logger.error(f"[qzone_auto_like] 秒评过程出错: {e}")
 
             _task_running = False
-
-            # 等待下一轮
             await asyncio.sleep(config.qzone_like_interval)
 
         except Exception as e:
             logger.error(f"[qzone_auto_like] 主循环异常: {e}")
             _task_running = False
             await asyncio.sleep(60)
-
-
-async def _run_like_pass(qq_number: str) -> None:
-    """执行一轮点赞。"""
-    # 每日限额检查
-    daily_limit = config.qzone_daily_like_limit
-    today_count = 0
-    if daily_limit > 0:
-        today_count = await store.get_today_liked_count(qq_number)
-        if today_count >= daily_limit:
-            logger.info(
-                f"[qzone_auto_like] 已达每日点赞上限({daily_limit})，本轮跳过"
-            )
-            return
-
-    logger.info(
-        f"[qzone_auto_like] 开始一轮空间说说点赞 "
-        f"QQ={qq_number} 最大数量={config.qzone_max_like_count} "
-        f"今日已点赞={today_count if daily_limit > 0 else 'N/A'}"
-    )
-
-    # 尝试导入 onebot-qzone 并执行点赞
-    try:
-        from onebot_qzone import QzoneSession
-    except ImportError:
-        logger.error(
-            "[qzone_auto_like] 未安装 onebot-qzone 库，"
-            "请执行: pip install onebot-qzone"
-        )
-        return
-
-    try:
-        qzone = QzoneSession(qq_number)
-        await qzone.login()
-        posts = await qzone.get_user_timeline(count=config.qzone_max_like_count)
-
-        all_post_ids: list[str] = []
-        for post in posts:
-            pid = post.get("postid") or post.get("id")
-            if pid:
-                all_post_ids.append(str(pid))
-
-        pending_ids = await store.filter_unliked(all_post_ids)
-        skipped = len(all_post_ids) - len(pending_ids)
-
-        if not pending_ids:
-            logger.info("[qzone_auto_like] 没有新的说说需要点赞")
-            return
-
-        if daily_limit > 0:
-            remaining = daily_limit - today_count
-            if remaining < len(pending_ids):
-                pending_ids = pending_ids[:remaining]
-
-        delay_low, delay_high = sorted(
-            (max(0.0, config.qzone_like_random_delay_min),
-             max(0.0, config.qzone_like_random_delay_max))
-        )
-
-        liked_count = 0
-        failed_count = 0
-        for post_id in pending_ids:
-            try:
-                await qzone.like(post_id)
-                await store.mark_liked(qq_number, post_id)
-                liked_count += 1
-                logger.debug(f"[qzone_auto_like] 已点赞说说 post_id={post_id}")
-            except Exception as e:
-                failed_count += 1
-                logger.warning(
-                    f"[qzone_auto_like] 点赞失败 post_id={post_id}: {e}"
-                )
-                continue
-
-            if delay_high > 0 and post_id != pending_ids[-1]:
-                await asyncio.sleep(random.uniform(delay_low, delay_high))
-
-        logger.info(
-            f"[qzone_auto_like] 本轮点赞完成 "
-            f"抓取={len(all_post_ids)} 跳过={skipped} "
-            f"新点赞={liked_count} 失败={failed_count} "
-            f"累计已点赞={await store.get_liked_count()} 条"
-        )
-
-    except Exception as e:
-        logger.error(f"[qzone_auto_like] 点赞过程出现错误: {e}")
 
 
 # ========== 命令：查询自动互动状态（限超级用户） ==========
@@ -359,7 +355,8 @@ async def query_status():
         + UniMessage.text(f"点赞每日上限：{config.qzone_daily_like_limit or '不限'} 条\n")
         + UniMessage.text(f"评论每日上限：{config.qzone_comment_daily_limit or '不限'} 条\n")
         + UniMessage.text(f"累计已点赞：{liked_count} 条\n")
-        + UniMessage.text(f"累计已评论：{commented_count} 条")
+        + UniMessage.text(f"累计已评论：{commented_count} 条\n")
+        + UniMessage.text(f"执行通道：桥接服务 {config.qzone_bridge_url}")
     )
 
     # 今日计数
@@ -430,7 +427,7 @@ async def _startup():
 
 @driver.on_bot_connect
 async def _on_bot_connect(_bot: Bot) -> None:
-    """Bot 连接 NapCat 后立即刷新 Cookie。"""
+    """Bot 连接后立即刷新 Cookie。"""
     if _cookie_refresher is None:
         return
     if not config.qzone_enable_auto_cookie:

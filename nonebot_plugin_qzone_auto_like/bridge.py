@@ -87,3 +87,23 @@ class QzoneBridgeClient:
             params["user_id"] = str(user_id)
         data = await self.call_data("send_comment", params)
         return data or {}
+
+    async def send_like(self, tid: str, user_id: str = "") -> dict[str, Any]:
+        """给指定说说点赞（走桥接服务，由其统一管理 UA 指纹与反爬）。
+
+        桥接服务内部走 internal_dolike_app -> like_cgi_likev6 -> Mobile 三级 fallback，
+        并对 User-Agent / Accept-Language 做随机化，比裸 HTTP 调用更不易被风控。
+        """
+        params: dict[str, Any] = {"tid": str(tid)}
+        if user_id:
+            params["user_id"] = str(user_id)
+        data = await self.call_data("send_like", params)
+        return data or {}
+
+    async def unlike(self, tid: str, user_id: str = "") -> dict[str, Any]:
+        """取消指定说说的点赞。"""
+        params: dict[str, Any] = {"tid": str(tid)}
+        if user_id:
+            params["user_id"] = str(user_id)
+        data = await self.call_data("unlike", params)
+        return data or {}
