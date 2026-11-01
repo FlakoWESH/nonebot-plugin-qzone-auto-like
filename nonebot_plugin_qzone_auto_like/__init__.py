@@ -31,7 +31,7 @@ from nonebot.plugin import PluginMetadata
 require("nonebot_plugin_alconna")
 from nonebot_plugin_alconna import UniMessage, on_alconna
 
-from .bridge import QzoneBridgeClient
+from .bridge import BridgeAuthError, QzoneBridgeClient
 from .config import QzoneAutoLikeConfig
 from .cookie_refresher import CookieRefresher
 from .feed import FeedScanner, QzonePost
@@ -262,6 +262,21 @@ async def _run_comment_pass(qq_number: str, posts: list[QzonePost]) -> None:
 
 
 # ========== 核心：自动互动循环（点赞/秒评共享一次扫描） ==========
+
+async def _scan_with_cookie_retry(scan_num: int) -> list[QzonePost]:
+    """拉取时间线；登录态失效时立即刷新 Cookie 并重试一次。"""
+    try:
+        return await FeedScanner(_bridge).scan(scan_num)
+    except BridgeAuthError:
+        if not config.qzone_enable_auto_cookie or _cookie_refresher is None:
+            raise
+        logger.warning("[qzone_auto_like] 桥接登录态失效，立即刷新 Cookie 后重试")
+        refreshed, _err = await _cookie_refresher.refresh_once(force=True)
+        if not refreshed:
+            raise
+        return await FeedScanner(_bridge).scan(scan_num)
+
+
 async def _auto_like_loop():
     """自动点赞+秒评后台循环任务。"""
     global _task_running
@@ -298,7 +313,7 @@ async def _auto_like_loop():
             if config.qzone_enable_auto_comment:
                 comment_scan = config.qzone_comment_max_per_round * 3
                 scan_num = max(scan_num, comment_scan, 50)
-            posts = await FeedScanner(_bridge).scan(scan_num)
+            posts = await _scan_with_cookie_retry(scan_num)
 
             if posts:
                 # ===== 点赞子任务 =====

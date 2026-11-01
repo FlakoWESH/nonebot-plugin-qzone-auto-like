@@ -14,6 +14,10 @@ class BridgeError(RuntimeError):
     """桥接服务调用失败。"""
 
 
+class BridgeAuthError(BridgeError):
+    """桥接服务登录态失效，需要刷新 Cookie。"""
+
+
 class QzoneBridgeClient:
     """onebot-qzone 桥接服务的轻量 HTTP 客户端。"""
 
@@ -55,8 +59,13 @@ class QzoneBridgeClient:
             raise BridgeError(f"{action} 返回了非 JSON 对象")
         retcode = body.get("retcode", -1)
         if retcode != 0:
+            message = str(body.get("message", "未知错误"))
+            if retcode == 1401 or "未登录" in message or "not logged in" in message:
+                raise BridgeAuthError(
+                    f"{action} 失败: retcode={retcode}, message={message}"
+                )
             raise BridgeError(
-                f"{action} 失败: retcode={retcode}, message={body.get('message', '未知错误')}"
+                f"{action} 失败: retcode={retcode}, message={message}"
             )
         return body.get("data")
 
